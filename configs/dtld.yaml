@@ -1,0 +1,37 @@
+data:
+  annotations: C:/Users/alexa/Desktop/Tesi_Autonomous_Driving/DTLD/v2.0
+  images: C:/Users/alexa/Desktop/Tesi_Autonomous_Driving/DTLD_jpg_plain
+  prepared: artifacts/data_validation
+model:
+  architecture: yolov8s.yaml
+  weights: artifacts/pretrained/yolov8s.pt
+  channels: 64
+  prior_conf: 0.05
+  nms_iou: 0.7
+  max_det: 300
+train:
+  seed: 42
+  epochs: 30
+  batch_size: 16
+  effective_batch: 16
+  workers: 4
+  prefetch_factor: 2
+  persistent_workers: true
+  cudnn_benchmark: true
+  lr: 0.0001
+  weight_decay: 0.0001
+  gamma: 0.95
+  amp: true
+  blur_probability: 0.1
+  global_weighting: inverse_sqrt
+  output: artifacts/training
+validation:
+  enabled: true
+  every_epochs: 1
+  selection_metric: global_mAP
+evaluate:
+  conf: 0.001
+  batch_size: 16
+  workers: 4
+  prefetch_factor: 2
+  persistent_workers: true
