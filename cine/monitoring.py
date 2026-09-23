@@ -1,5 +1,6 @@
 """GPU-side loss aggregation and per-epoch validation, without test-set access."""
 import json
+import os
 from pathlib import Path
 import time
 
@@ -65,6 +66,8 @@ def validate_epoch(model, config, batches, output=None):
         metrics = dict(images=len(rows), losses=meter.result(), **global_metrics([r['global_label'] for r in rows], [p['global_probabilities'] for p in predictions]))
         for mode in ['object', 'relevance', 'state']:
             metrics[mode] = coco_metrics(rows, predictions, mode)
+        from .diagnostics import local_diagnostics
+        metrics['local_diagnostics'] = local_diagnostics(rows, predictions)
         metrics['seconds'] = time.perf_counter() - begin
         if output:
             write_json(output, metrics)
@@ -108,5 +111,15 @@ def plot_history(history, output):
         ax.grid(alpha=0.2)
     fig.suptitle('Train vs clean sequence-held-out validation (no test metrics)')
     fig.tight_layout()
-    fig.savefig(output, dpi=140)
+    output = Path(output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Windows can reject reopening an existing PNG while a viewer or scanner holds it.
+    temporary = output.with_name(f'{output.stem}.{os.getpid()}.tmp.png')
+    fig.savefig(temporary, dpi=140)
+    try:
+        os.replace(temporary, output)
+    except OSError:
+        # A locked previous plot must not invalidate a completed training epoch.
+        fallback = output.with_name(f'{output.stem}.epoch_{epochs[-1]:03d}.png')
+        os.replace(temporary, fallback)
     plt.close(fig)

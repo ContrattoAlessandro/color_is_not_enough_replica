@@ -10,6 +10,8 @@ import torch
 from .data import DTLDDataset
 from .loading import loader, shutdown_loader
 from .model import JointModel
+from .phases import phase_at, set_phase, optimizer_for
+from .selection import selection_key
 from .utils import move_batch, seed_everything, sha256, versions, write_json
 
 
@@ -17,6 +19,7 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, config, ba
     obj = dict(model=model.state_dict(), optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(), scaler=scaler.state_dict(), epoch=epoch, config=config, batch_size=batch_size, fingerprints=fingerprints, versions=versions(), transfer_report=model.transfer_report, best_score=best_score, history=history or [], rng=dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(), cuda=torch.cuda.get_rng_state_all()))
     obj['global_class_weights'] = model.global_class_weights.detach().cpu().tolist()
     obj['global_class_counts'] = model.global_class_counts
+    obj['training_phase'] = getattr(model, 'training_phase', 'joint')
     path = Path(path)
     tmp = path.with_suffix('.tmp')
     torch.save(obj, tmp)
@@ -48,6 +51,11 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
     if not (prepared / 'audit.json').is_file():
         raise RuntimeError('Audited manifests are required')
     validation_enabled = config.get('validation', {}).get('enabled', False)
+    if tc.get('recipe') == 'staged' and not validation_enabled:
+        raise ValueError('Staged training requires local-checkpoint validation')
+    weights = tc.get('task_weights', {})
+    if set(weights) - {'detection', 'relevance', 'state', 'global_loss'} or any(not np.isfinite(v) or v < 0 for v in weights.values()):
+        raise ValueError('Task weights must be finite nonnegative coefficients for known tasks')
     names = ['train', 'val', 'test'] if validation_enabled else ['train', 'test']
     fingerprints = {name: sha256(prepared / f'{name}.json') for name in names}
     if validation_enabled:
@@ -73,7 +81,8 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
         raise ValueError('Checkpoint global weights differ from training partition')
     if bs < 1 or tc['effective_batch'] % bs:
         raise ValueError('Microbatch must divide effective batch')
-    optimizer = torch.optim.AdamW(model.parameters(), lr=tc['lr'], weight_decay=tc['weight_decay'])
+    current_phase = phase_at(config, max(0, checkpoint['epoch'] - 1) if resume else 0)
+    optimizer = optimizer_for(model, config, current_phase)
     update_counter = {'steps': 0}
     def count_update(optimizer, args, kwargs):
         update_counter['steps'] += 1
@@ -95,7 +104,7 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
         torch.set_rng_state(rng['torch'])
         torch.cuda.set_rng_state_all(rng['cuda'])
     write_json(out / 'experiment.json', dict(config=config, versions=versions(), fingerprints=fingerprints, batch_size=bs, samples=len(dataset), requested_epochs=max_epochs, transfer=model.transfer_report, feature_channels=model.feature_channels, global_class_weights=model.global_class_weights.cpu().tolist(), global_class_counts=model.global_class_counts, parameters=sum(p.numel() for p in model.parameters()), initialization='resumed clean-split checkpoint' if resume else 'fresh COCO compatible tensors; no weights from previous run or benchmark', loss_averaging='detector/total by images, attributes by assigned foreground candidates, global weighted sum divided by valid image count'))
-    batches = loader(dataset, bs, tc['workers'], True, tc['seed'], tc.get('prefetch_factor', 2), tc.get('persistent_workers', False))
+    batches = loader(dataset, bs, tc['workers'], True, tc['seed'], tc.get('prefetch_factor', 2), tc.get('persistent_workers', False), sampler_mode=tc.get('sampler', 'image'))
     val_batches = None
     if validation_enabled:
         ec = config['evaluate']
@@ -105,8 +114,21 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
     begin = time.perf_counter()
     try:
         for epoch in range(start_epoch, max_epochs):
+            requested_phase = phase_at(config, epoch)
+            if requested_phase != current_phase:
+                if requested_phase == 'global':
+                    local = torch.load(out / 'local_best.pt', map_location='cpu', weights_only=False)
+                    model.load_state_dict(local['model'])
+                    del local
+                update_hook.remove()
+                optimizer = optimizer_for(model, config, requested_phase)
+                update_hook = optimizer.register_step_post_hook(count_update)
+                scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=tc['gamma'])
+                scaler = torch.amp.GradScaler('cuda', enabled=tc['amp'])
+                current_phase = requested_phase
             updates_before = update_counter['steps']
             model.train()
+            set_phase(model, current_phase)
             batches.sampler.set_epoch(epoch)
             optimizer.zero_grad(set_to_none=True)
             meter, seen, data_wait = LossMeter(), 0, 0.0
@@ -140,7 +162,7 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
                 del prediction, loss, batch, components
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - epoch_start
-            row = dict(epoch=epoch + 1, train_seconds=elapsed, images_per_second=seen / elapsed, data_wait_seconds=data_wait, peak_reserved_gb=torch.cuda.max_memory_reserved() / 2**30, train_losses=meter.result())
+            row = dict(epoch=epoch + 1, training_phase=current_phase, train_seconds=elapsed, images_per_second=seen / elapsed, data_wait_seconds=data_wait, peak_reserved_gb=torch.cuda.max_memory_reserved() / 2**30, train_losses=meter.result())
             row['optimizer_updates'] = update_counter['steps'] - updates_before
             row['amp_skipped_updates'] = (len(batches) + accumulation - 1) // accumulation - row['optimizer_updates']
             if row['optimizer_updates'] == 0:
@@ -150,11 +172,18 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
                 write_json(out / 'status.json', dict(phase='validation', epoch=epoch + 1, epochs=max_epochs, images=len(val_batches.dataset)))
                 metrics = validate_epoch(model, config, val_batches, out / 'validation' / f'epoch_{epoch + 1:03d}.json')
                 row['validation'] = metrics
-                score = metrics['global_mAP']
+                score = selection_key(metrics, config['validation']) if current_phase == 'joint' else None
                 improved = score is not None and (best_score is None or score > best_score)
                 if improved:
                     best_score = score
-                row['best_validation_global_mAP'] = best_score
+                row['best_validation_global_mAP'] = max([r['validation']['global_mAP'] for r in history if r.get('validation', {}).get('global_mAP') is not None] + [metrics['global_mAP']]) if metrics['global_mAP'] is not None else None
+                row['best_selection_score'] = best_score
+                row['selection_key'] = score
+                if current_phase == 'local':
+                    local_score = (metrics['object']['AP50_95'] + metrics['state']['AP50_95']) / 2
+                    previous = [r['local_score'] for r in history if 'local_score' in r]
+                    row['local_score'] = local_score
+                    row['save_local_best'] = not previous or local_score > max(previous)
                 print('Validation metrics: ' + json.dumps(metrics), flush=True)
             scheduler.step()
             row['next_lr'] = scheduler.get_last_lr()[0]
@@ -163,9 +192,11 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
             write_json(out / 'history.json', history)
             if val_batches is not None:
                 plot_history(history, out / 'learning_curves.png')
-            save_checkpoint(out / 'last.pt', model, optimizer, scheduler, scaler, epoch + 1, config, bs, fingerprints, best_score, history)
+            if row.get('save_local_best'):
+                save_checkpoint(out / 'local_best.pt', model, optimizer, scheduler, scaler, epoch + 1, config, bs, fingerprints, best_score, history)
             if improved:
                 save_checkpoint(out / 'best.pt', model, optimizer, scheduler, scaler, epoch + 1, config, bs, fingerprints, best_score, history)
+            save_checkpoint(out / 'last.pt', model, optimizer, scheduler, scaler, epoch + 1, config, bs, fingerprints, best_score, history)
             print(f'Saved epoch {epoch + 1}; best validation global mAP: {best_score}', flush=True)
         save_checkpoint(out / 'final.pt', model, optimizer, scheduler, scaler, max_epochs, config, bs, fingerprints, best_score, history)
         write_json(out / 'status.json', dict(phase='training_complete', epochs=max_epochs, elapsed_seconds=time.perf_counter() - begin))

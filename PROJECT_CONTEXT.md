@@ -11,7 +11,7 @@ The project adapts the paper "Color Is Not Enough: Dataset and Method for Identi
 - per-object light state;
 - image-level global classification: RR (relevant red), RG (relevant green), or NoR (no relevant light).
 
-The completed campaign selected a YOLOv8s model with inverse-square-root weighting for the global classification loss. Five independent seeds (42, 43, 44, 45, 46) were trained and evaluated after the configuration was frozen. Seed 42 is the primary checkpoint; the five checkpoints are independent models, not an ensemble. No training process is currently running.
+The completed campaign selected a YOLOv8s model with inverse-square-root weighting for the global classification loss. Five independent seeds (42, 43, 44, 45, 46) were trained and evaluated after the configuration was frozen. Seed 42 is the primary checkpoint; the five checkpoints are independent models, not an ensemble. The retained campaign is complete; the separate improvement_v2 follow-up is described below.
 
 The repository was cleaned after selection. Discarded experiments, duplicate checkpoints, raw prediction dumps, smoke outputs, and campaign-only orchestration tools were removed. The retained code and artifacts are sufficient to prepare data, train, evaluate, audit generalization, and run inference.
 
@@ -40,7 +40,7 @@ Input geometry:
 - 8 pixels of vertical padding produce a 1280 x 736 model canvas;
 - source-to-model coordinates are x' = 0.703125*x - 80 and y' = 0.703125*y + 8.
 
-Local state handling is deliberately simplified relative to the paper:
+Local state handling uses the following mapping; exact equivalence to the paper remains unverified:
 
 - red, yellow, and red_yellow map to red;
 - green maps to green;
@@ -179,7 +179,7 @@ The weighted model is consistently better, but split-to-split variation remains 
 1. Harmonize the protocol before claiming paper-level reproduction. Train/evaluate on the paper's official split and full official training pool where possible, reproduce its state taxonomy and relevance/global-label definitions, and report the current masked-label results separately.
 2. Attack NoR generalization directly. Audit errors by sequence and scene type (empty scenes, visible irrelevant lights, intersection exits, and ambiguous annotations); use sequence-balanced sampling or hard-negative mining; and keep global mAP as the checkpoint-selection metric.
 3. Improve local evidence if state/detection remains limiting. Test YOLOv8m after the s-model is established, then consider a P2/high-resolution feature level or a crop/RoI attribute head for tiny traffic lights. Keep architecture changes isolated.
-4. Restore the paper's state detail in a separate experiment. The current red/yellow/red-yellow collapse makes the comparison easier but loses information; a four-state local head can be evaluated while retaining the three global classes.
+4. Verify the paper's exact state mapping before changing the taxonomy. It describes four annotation states but explicitly mentions a three-class classifier; a fourth model output is not established as a reproduction requirement.
 5. Use calibration only as a separate validation analysis. It can improve balanced accuracy reporting, but it does not substitute for better ranking or detection.
 6. Defer temporal modeling, external data, and large resolution changes until protocol and local/global failure modes are established.
 
@@ -221,3 +221,9 @@ Typical commands from the repository root:
     python -m pytest -q
 
 README.md describes the supported workflow. artifacts/results/cleanup_manifest.json maps retained checkpoint paths to their original paths and verifies SHA-256 preservation. No source DTLD files or the supplied paper PDF were altered.
+
+## P2-first follow-up implementation
+
+The approved bounded campaign is implemented in `cine.campaign`. It compares sequence-aware sampling, stride-4 P2 detection and 10/2/18 staged training, retaining the original data geometry and three-class local taxonomy. See `docs/IMPROVEMENT_CAMPAIGN.md` for exact gates. New artifacts are isolated under `artifacts/improvement_v2`; the original retained model and reports are preserved.
+
+Training-manifest inspection found a median transformed box width of 5.625 pixels, with 69.7% narrower than 8 pixels. This motivates P2 but is not evidence of a measured performance gain. The first P2 batch-8 dense-scene probe reserved about 6.92 GiB, leaving about 3.80 GiB free; batch 16 failed the 1 GiB headroom requirement. Current progress and final outcomes are recorded in the campaign status.json and RESULTS.md, respectively.

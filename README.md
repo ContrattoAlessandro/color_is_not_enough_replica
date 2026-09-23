@@ -54,3 +54,7 @@ Official-test mean and sample standard deviation over five seeds:
 See artifacts/results/RESULTS.md and final_report.json. This remains a methodological adaptation: the internal holdout, state mapping, and masked global labels differ from the paper. Global targets were approached but not reached on the five-seed means.
 
 Environment: Python 3.12, PyTorch 2.11.0+cu130, torchvision 0.26.0+cu130, Ultralytics 8.4.116, RTX 5070 12 GB. See requirements.txt and docs/METHODOLOGY.md.
+
+## New improvement campaign
+
+The P2-first campaign adds controlled sampling, P2 detection and staged-training trials. Run `python -m cine.campaign run`; inspect progress with `python -m cine.campaign status`. All new outputs are isolated under `artifacts/improvement_v2` and existing selected models remain available. See [docs/IMPROVEMENT_CAMPAIGN.md](docs/IMPROVEMENT_CAMPAIGN.md) for selection gates, resume behavior and reporting.

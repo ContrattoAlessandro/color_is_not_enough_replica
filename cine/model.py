@@ -51,30 +51,34 @@ class JointModel(nn.Module):
         super().__init__()
         self.config = config
         architecture = config['model'].get('architecture', 'yolov8n.yaml')
-        if architecture not in ('yolov8n.yaml', 'yolov8s.yaml', 'yolov8m.yaml'):
-            raise ValueError('Supported architectures: yolov8n.yaml, yolov8s.yaml, yolov8m.yaml')
+        if architecture not in ('yolov8n.yaml', 'yolov8s.yaml', 'yolov8m.yaml', 'yolov8s-p2.yaml'):
+            raise ValueError('Unsupported YOLO architecture')
         self.detector = DetectionModel(architecture, nc=1, verbose=False)
         self.detector.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
         self.transfer_report = {}
         if pretrained:
             source = YOLO(config["model"]["weights"]).model.float()
-            original, target = source.state_dict(), self.detector.state_dict()
-            # Older COCO files have width/depth multipliers, not a 'scale' key.
-            # Validate actual backbone/neck tensor shapes, allowing the one-class head to differ.
-            head_prefix = f'model.{len(self.detector.model) - 1}.'
-            if any(k not in original or original[k].shape != v.shape
-                   for k, v in target.items() if not k.startswith(head_prefix)):
-                raise ValueError('Pretrained backbone/neck must match the configured YOLO scale')
-            compatible = {k: v for k, v in original.items() if k in target and v.shape == target[k].shape}
-            self.detector.load_state_dict(compatible, strict=False)
-            copied_outputs = 0
-            for old, new in zip(source.model[-1].cv3, self.detector.model[-1].cv3):
-                if old[-1].weight.shape[1:] == new[-1].weight.shape[1:]:
-                    with torch.no_grad():
-                        new[-1].weight.copy_(old[-1].weight[9:10])
-                        new[-1].bias.copy_(old[-1].bias[9:10])
-                    copied_outputs += 1
-            self.transfer_report = {"compatible_tensors": len(compatible), "total_tensors": len(target), "traffic_light_output_layers_copied": copied_outputs, "note": "Standard nc=1 head widths may differ from COCO; incompatible classification tensors are freshly initialized."}
+            if architecture == 'yolov8s-p2.yaml':
+                from .transfer import transfer_p2
+                self.transfer_report = transfer_p2(source, self.detector)
+            else:
+                original, target = source.state_dict(), self.detector.state_dict()
+                # Older COCO files have width/depth multipliers, not a 'scale' key.
+                # Validate actual backbone/neck tensor shapes, allowing the one-class head to differ.
+                head_prefix = f'model.{len(self.detector.model) - 1}.'
+                if any(k not in original or original[k].shape != v.shape
+                       for k, v in target.items() if not k.startswith(head_prefix)):
+                    raise ValueError('Pretrained backbone/neck must match the configured YOLO scale')
+                compatible = {k: v for k, v in original.items() if k in target and v.shape == target[k].shape}
+                self.detector.load_state_dict(compatible, strict=False)
+                copied_outputs = 0
+                for old, new in zip(source.model[-1].cv3, self.detector.model[-1].cv3):
+                    if old[-1].weight.shape[1:] == new[-1].weight.shape[1:]:
+                        with torch.no_grad():
+                            new[-1].weight.copy_(old[-1].weight[9:10])
+                            new[-1].bias.copy_(old[-1].bias[9:10])
+                        copied_outputs += 1
+                self.transfer_report = {"compatible_tensors": len(compatible), "total_tensors": len(target), "traffic_light_output_layers_copied": copied_outputs, "note": "Standard nc=1 head widths may differ from COCO; incompatible classification tensors are freshly initialized."}
         channels = [branch[0].conv.in_channels for branch in self.detector.model[-1].cv2]
         self.feature_channels = channels
         if config['model'].get('joint_priors', False):
@@ -164,7 +168,12 @@ class JointModel(nn.Module):
         else:
             glob = prediction['global_logits'].sum() * 0
         losses = dict(box=det[0], cls=det[1], dfl=det[2], relevance=rel, state=state, global_loss=glob)
-        total = sum(losses.values())
+        weights = self.config['train'].get('task_weights', {})
+        phase = getattr(self, 'training_phase', 'joint')
+        total = sum(value * weights.get('detection' if key in ('box', 'cls', 'dfl') else key, 1.0)
+                    * (0.0 if (phase == 'local' and key == 'global_loss') or
+                       (phase == 'global' and key != 'global_loss') else 1.0)
+                    for key, value in losses.items())
         return total, {k: v.detach() for k, v in losses.items()}
 
     @torch.no_grad()
