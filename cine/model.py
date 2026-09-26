@@ -46,6 +46,68 @@ def rasterize(boxes, scores, relevance, states, features, conf=0.05, iou=0.7, ma
     return masks
 
 
+@torch.no_grad()
+def box_evidence(boxes, scores, relevance, states, features, topk=64, conf=0.05):
+    """Detached top-K dense candidates, without NMS or rasterization.
+
+    Clip coordinates to image content, normalize as in local heads, and encode
+    level as the normalized pyramid index. Padding is explicitly masked.
+    """
+    boxes = boxes.detach().float().clone()
+    finite_boxes = torch.isfinite(boxes).all(-1)
+    scores, relevance, states = (x.detach().float() for x in (scores, relevance, states))
+    boxes[..., [0, 2]] = boxes[..., [0, 2]].clamp(0, WIDTH)
+    boxes[..., [1, 3]] = boxes[..., [1, 3]].clamp(PAD, PAD + CONTENT_HEIGHT)
+    coords = boxes / boxes.new_tensor([WIDTH, CONTENT_HEIGHT, WIDTH, CONTENT_HEIGHT])
+    coords[..., [1, 3]] -= PAD / CONTENT_HEIGHT
+    size = coords[..., 2:] - coords[..., :2]
+    log_area = size.prod(-1).clamp_min(1e-12).log().unsqueeze(-1)
+    levels = torch.cat([scores.new_full((f.shape[-2] * f.shape[-1],), i / max(1, len(features) - 1))
+                        for i, f in enumerate(features)])
+    values = torch.cat([coords, log_area, levels[None, :, None].expand(len(boxes), -1, -1),
+                        scores[..., None], (scores * relevance)[..., None], scores[..., None] * states], -1)
+    valid = finite_boxes & (scores >= conf) & (size > 0).all(-1) & torch.isfinite(values).all(-1)
+    evidence = values.new_zeros((len(boxes), topk, 11))
+    mask = torch.zeros((len(boxes), topk), device=boxes.device, dtype=torch.bool)
+    for b in range(len(boxes)):
+        ids = valid[b].nonzero(as_tuple=True)[0]
+        k = min(topk, len(ids))
+        if not k:
+            continue
+        chosen = ids[scores[b, ids].topk(k).indices]
+        # Cutoff ties use feature values, never input order: invariance also
+        # holds when more than K boxes have the same score.
+        cutoff = scores[b, chosen].min()
+        tied = ids[scores[b, ids] == cutoff]
+        higher = chosen[scores[b, chosen] > cutoff]
+        if len(tied) > k - len(higher):
+            for col in reversed(range(values.shape[-1])):
+                tied = tied[values[b, tied, col].argsort(stable=True)]
+            chosen = torch.cat([higher, tied[:k - len(higher)]])
+        evidence[b, :k] = values[b, chosen]
+        mask[b, :k] = True
+    return evidence, mask
+
+
+class SetEvidencePool(nn.Module):
+    """Shared 11->128->128 MLP; attention over boxes plus learned NULL."""
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(11, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
+        self.null_token = nn.Parameter(torch.zeros(1, 1, 128))
+        nn.init.normal_(self.null_token, std=0.02)
+        self.attention = nn.Linear(128, 1)
+
+    def forward(self, evidence, valid):
+        tokens = self.mlp(evidence.detach())
+        tokens = torch.cat([tokens, self.null_token.to(tokens.dtype).expand(len(tokens), -1, -1)], 1)
+        valid = torch.cat([valid, valid.new_ones((len(valid), 1))], 1)
+        logits = self.attention(tokens).squeeze(-1).float().masked_fill(~valid, -torch.inf)
+        weights = logits.softmax(-1)
+        pooled = (tokens.float() * weights[..., None]).sum(1).to(tokens.dtype)
+        return pooled, weights
+
+
 class JointModel(nn.Module):
     def __init__(self, config, pretrained=True):
         super().__init__()
@@ -91,8 +153,18 @@ class JointModel(nn.Module):
         self.relevance = nn.ModuleList([nn.Linear(c + 4, 1) for _ in channels])
         self.state = nn.ModuleList([nn.Linear(c + 4, 3) for _ in channels])
         self.global_project = nn.ModuleList([nn.Conv2d(ch, c, 1) for ch in channels])
-        self.global_conv = nn.ModuleList([nn.Sequential(nn.Conv2d(c + 5, c, 3, stride=2, padding=1), nn.ReLU(), nn.Conv2d(c, c, 3, stride=2, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1)) for _ in channels])
-        self.global_classifier = nn.Linear(len(channels) * c, 3)
+        self.global_head = config['model'].get('global_head', 'raster')
+        if self.global_head == 'raster':
+            self.global_conv = nn.ModuleList([nn.Sequential(nn.Conv2d(c + 5, c, 3, stride=2, padding=1), nn.ReLU(), nn.Conv2d(c, c, 3, stride=2, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1)) for _ in channels])
+            self.global_classifier = nn.Linear(len(channels) * c, 3)
+        elif self.global_head == 'set_null':
+            self.global_topk = config['model'].get('set_topk', 64)
+            if not isinstance(self.global_topk, int) or isinstance(self.global_topk, bool) or self.global_topk < 1:
+                raise ValueError('set_topk must be a positive integer')
+            self.global_set_pool = SetEvidencePool()
+            self.global_classifier = nn.Linear(len(channels) * c + 128, 3)
+        else:
+            raise ValueError('Unknown global_head; expected raster or set_null')
         self.criterion = None
 
     def configure_global_weights(self, rows):
@@ -142,9 +214,19 @@ class JointModel(nn.Module):
         rel, state = torch.cat(rel, 1), torch.cat(state, 1)
         scores = raw["scores"].squeeze(1).sigmoid()
         mc = self.config["model"]
-        masks = rasterize(boxes.detach(), scores.detach(), rel.detach().sigmoid(), state.detach().softmax(-1), features, mc["prior_conf"], mc["nms_iou"], mc["max_det"])
-        pooled = [conv(torch.cat([proj(f), mask], 1)).flatten(1) for f, mask, proj, conv in zip(features, masks, self.global_project, self.global_conv)]
-        return dict(raw=raw, boxes=boxes, scores=scores, relevance_logits=rel, state_logits=state, global_logits=self.global_classifier(torch.cat(pooled, 1)), priors=masks)
+        extra = {}
+        if self.global_head == 'raster':
+            masks = rasterize(boxes.detach(), scores.detach(), rel.detach().sigmoid(), state.detach().softmax(-1), features, mc["prior_conf"], mc["nms_iou"], mc["max_det"])
+            pooled = [conv(torch.cat([proj(f), mask], 1)).flatten(1) for f, mask, proj, conv in zip(features, masks, self.global_project, self.global_conv)]
+        else:
+            evidence, valid = box_evidence(boxes, scores, rel.detach().sigmoid(), state.detach().softmax(-1),
+                                           features, self.global_topk, mc['prior_conf'])
+            tokens, attention = self.global_set_pool(evidence, valid)
+            pooled = [F.adaptive_avg_pool2d(proj(f), 1).flatten(1) for f, proj in zip(features, self.global_project)]
+            pooled.append(tokens)
+            masks = []
+            extra = dict(box_evidence=evidence, evidence_valid=valid, evidence_attention=attention)
+        return dict(raw=raw, boxes=boxes, scores=scores, relevance_logits=rel, state_logits=state, global_logits=self.global_classifier(torch.cat(pooled, 1)), priors=masks, **extra)
 
     def loss(self, prediction, batch):
         assigned, det, _ = self.criterion.get_assigned_targets_and_loss(prediction["raw"], batch)

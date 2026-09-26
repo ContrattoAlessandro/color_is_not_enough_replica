@@ -58,3 +58,7 @@ Environment: Python 3.12, PyTorch 2.11.0+cu130, torchvision 0.26.0+cu130, Ultral
 ## New improvement campaign
 
 The P2-first campaign adds controlled sampling, P2 detection and staged-training trials. Run `python -m cine.campaign run`; inspect progress with `python -m cine.campaign status`. All new outputs are isolated under `artifacts/improvement_v2` and existing selected models remain available. See [docs/IMPROVEMENT_CAMPAIGN.md](docs/IMPROVEMENT_CAMPAIGN.md) for selection gates, resume behavior and reporting.
+
+## Set-based global-head ablation
+
+The P2 global-head proposal uses top-64 detached box evidence, attention pooling with a learned NULL token, and scene GAP on standard YOLOv8s. See [docs/P2_SET_NULL.md](docs/P2_SET_NULL.md) for the config, commands, baseline metrics, and the distinction from the earlier sampler and stride-4 detector experiments.
