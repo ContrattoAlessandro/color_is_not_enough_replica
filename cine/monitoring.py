@@ -68,6 +68,8 @@ def validate_epoch(model, config, batches, output=None):
             metrics[mode] = coco_metrics(rows, predictions, mode)
         from .diagnostics import local_diagnostics
         metrics['local_diagnostics'] = local_diagnostics(rows, predictions)
+        from .diagnostics import relevance_diagnostics
+        metrics['relevance_diagnostics'] = relevance_diagnostics(rows, predictions)
         metrics['seconds'] = time.perf_counter() - begin
         if output:
             write_json(output, metrics)

@@ -62,3 +62,9 @@ The P2-first campaign adds controlled sampling, P2 detection and staged-training
 ## Set-based global-head ablation
 
 The P2 global-head proposal uses top-64 detached box evidence, attention pooling with a learned NULL token, and scene GAP on standard YOLOv8s. See [docs/P2_SET_NULL.md](docs/P2_SET_NULL.md) for the config, commands, baseline metrics, and the distinction from the earlier sampler and stride-4 detector experiments.
+
+## PS appearance augmentation (medium NULL model)
+
+The retained PS recipe applies photometric and sensor changes during training.
+See [docs/AUG_PS.md](docs/AUG_PS.md) for its exact policy, training config,
+commands, and the saved comparison with the legacy blur-only baseline.

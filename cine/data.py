@@ -136,12 +136,18 @@ def prepare(config):
 
 
 class DTLDDataset(Dataset):
-    def __init__(self, manifest, blur_probability=0.0, limit=None, augment_seed=42):
+    def __init__(self, manifest, blur_probability=0.0, limit=None, augment_seed=42, augmentation=None, record_augmentation=False):
         self.rows = json.loads(Path(manifest).read_text(encoding="utf-8"))
         if limit:
             self.rows = self.rows[:limit]
         self.blur_probability = blur_probability
         self.augment_seed = augment_seed
+        if augmentation is not None:
+            from .augmentation import validate_policy
+            self.augmentation = validate_policy(augmentation)
+        else:
+            self.augmentation = None
+        self.record_augmentation = record_augmentation
 
     def __len__(self):
         return len(self.rows)
@@ -155,8 +161,14 @@ class DTLDDataset(Dataset):
         rng = random.Random(self.augment_seed + epoch * 1000003 + index * 9176)
         row = self.rows[index]
         img = process_image(read_image(row["path"]))
-        if rng.random() < self.blur_probability:
+        operations = []
+        identity = (row['sequence'], row['id'])
+        if self.augmentation is not None:
+            from .augmentation import apply
+            img, operations = apply(img, self.augmentation, self.augment_seed, epoch, identity)
+        elif rng.random() < self.blur_probability:
             img = cv2.GaussianBlur(img, (3, 3), rng.uniform(0.1, 1.0))
+            operations = ['blur']
         # BGR -> RGB CHW. Keep uint8 until transfer to GPU.
         tensor = torch.from_numpy(np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1)))
         boxes = torch.tensor(row["boxes"], dtype=torch.float32).reshape(-1, 4)
@@ -164,9 +176,15 @@ class DTLDDataset(Dataset):
         xywh[:, :2] = (boxes[:, :2] + boxes[:, 2:]) / 2
         xywh[:, 2:] = boxes[:, 2:] - boxes[:, :2]
         xywh /= torch.tensor([WIDTH, HEIGHT, WIDTH, HEIGHT])
-        return dict(img=tensor, bboxes=xywh, relevance=torch.tensor(row["relevance"], dtype=torch.float32), states=torch.tensor(row["states"], dtype=torch.long), global_label=row["global_label"], id=row["id"])
+        item = dict(img=tensor, bboxes=xywh, relevance=torch.tensor(row["relevance"], dtype=torch.float32), states=torch.tensor(row["states"], dtype=torch.long), global_label=row["global_label"], id=row["id"])
+        if self.augmentation is not None or self.record_augmentation:
+            item['augmentation_operations'] = operations
+        return item
 
 
 def collate(items):
     counts = [len(x["bboxes"]) for x in items]
-    return dict(img=torch.stack([x["img"] for x in items]), bboxes=torch.cat([x["bboxes"] for x in items]), cls=torch.zeros(sum(counts), 1), batch_idx=torch.repeat_interleave(torch.arange(len(items)), torch.tensor(counts)), relevance=torch.cat([x["relevance"] for x in items]), states=torch.cat([x["states"] for x in items]), global_label=torch.tensor([x["global_label"] for x in items]), ids=[x["id"] for x in items])
+    result = dict(img=torch.stack([x["img"] for x in items]), bboxes=torch.cat([x["bboxes"] for x in items]), cls=torch.zeros(sum(counts), 1), batch_idx=torch.repeat_interleave(torch.arange(len(items)), torch.tensor(counts)), relevance=torch.cat([x["relevance"] for x in items]), states=torch.cat([x["states"] for x in items]), global_label=torch.tensor([x["global_label"] for x in items]), ids=[x["id"] for x in items])
+    if any('augmentation_operations' in x for x in items):
+        result['augmentation_operations'] = [x.get('augmentation_operations', []) for x in items]
+    return result

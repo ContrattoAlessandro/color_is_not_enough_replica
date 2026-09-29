@@ -20,6 +20,7 @@ def main():
     e.add_argument("--checkpoint", required=True)
     e.add_argument("--output")
     e.add_argument("--limit", type=int)
+    e.add_argument("--split", choices=("train", "val", "test"), default="test")
     a = sub.add_parser("audit", help="Evaluate a checkpoint on validation and report sequence/scene errors")
     a.add_argument("--checkpoint", required=True)
     a.add_argument("--output", default="artifacts/validation_audit")
@@ -63,7 +64,7 @@ def main():
             raise
     elif args.command == "evaluate":
         from .evaluate import evaluate
-        evaluate(config, args.checkpoint, args.output, args.limit)
+        evaluate(config, args.checkpoint, args.output, args.limit, args.split)
     elif args.command == "audit":
         from .generalization import audit_checkpoint
         audit_checkpoint(args.checkpoint, args.output)

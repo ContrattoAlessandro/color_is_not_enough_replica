@@ -43,3 +43,19 @@ def local_diagnostics(rows, predictions):
             state_accuracy=float(np.trace(confusion[i])/matched[i]) if matched[i] else None,
             state_confusion=confusion[i].tolist()) for i,name in enumerate(BINS)}
     return dict(confidence=.05, matching='score-ordered one-to-one, class-agnostic', width_bins=BINS, by_iou=output)
+
+
+def relevance_diagnostics(rows, predictions):
+    """Attribute confusion is conditional on matching; misses remain explicit."""
+    matrix = np.zeros((2, 2), dtype=int)
+    missed, total = 0, 0
+    for row, prediction in zip(rows, predictions):
+        matches = matched_boxes(row['boxes'], prediction, .5)
+        matched = {i for i, _ in matches}
+        total += sum(row['relevance'])
+        missed += sum(r for i, r in enumerate(row['relevance']) if i not in matched)
+        for i, j in matches:
+            matrix[row['relevance'][i], int(prediction['relevance'][j] >= .5)] += 1
+    return dict(confidence=.05, iou=.5, relevance_threshold=.5,
+                class_order=['irrelevant', 'relevant'], matched_confusion=matrix.tolist(),
+                relevant_ground_truth=int(total), missed_relevant=int(missed))

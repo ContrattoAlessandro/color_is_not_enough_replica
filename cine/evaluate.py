@@ -75,15 +75,17 @@ def draw_prediction(image, prediction, threshold=0.25):
 
 
 @torch.no_grad()
-def evaluate(config, checkpoint, output=None, limit=None):
-    out = Path(output or Path(checkpoint).parent / "evaluation")
+def evaluate(config, checkpoint, output=None, limit=None, split='test'):
+    if split not in ('train', 'val', 'test'):
+        raise ValueError("Evaluation split must be train, val or test")
+    out = Path(output or Path(checkpoint).parent / f"evaluation_{split}")
     out.mkdir(parents=True, exist_ok=True)
     model, ck = load_checkpoint(checkpoint)
     if ck["config"] != config:
         raise ValueError("Use the same config as the training checkpoint")
-    manifest = Path(config["data"]["prepared"]) / "test.json"
-    if sha256(manifest) != ck["fingerprints"]["test"]:
-        raise ValueError("Test manifest differs from checkpoint")
+    manifest = Path(config["data"]["prepared"]) / f"{split}.json"
+    if sha256(manifest) != ck["fingerprints"][split]:
+        raise ValueError(f"{split.title()} manifest differs from checkpoint")
     model.eval()
     dataset = DTLDDataset(manifest, limit=limit)
     ec = config["evaluate"]
@@ -113,7 +115,7 @@ def evaluate(config, checkpoint, output=None, limit=None):
     valid = labels >= 0
     probabilities = np.array([p["global_probabilities"] for p in predictions])
     aps = {name: float(average_precision_score(labels[valid] == i, probabilities[valid, i])) if np.any(labels[valid] == i) else None for i, name in enumerate(GLOBAL_NAMES)}
-    metrics = dict(images=len(dataset), global_valid=int(valid.sum()), global_masked=int((~valid).sum()), global_coverage=float(valid.mean()), global_AP=aps, global_mAP=float(np.mean([v for v in aps.values() if v is not None])) if any(v is not None for v in aps.values()) else None, balanced_accuracy=float(balanced_accuracy_score(labels[valid], probabilities[valid].argmax(1))) if valid.any() else None, confusion_matrix=confusion_matrix(labels[valid], probabilities[valid].argmax(1), labels=[0, 1, 2]).tolist(), class_order=GLOBAL_NAMES, inference_ms_per_image=1000 * sum(t for t, n in latencies) / sum(n for t, n in latencies), inference_batch_size=ec["batch_size"], inference_timing="GPU model + both NMS paths, synchronized, excludes loading and CPU serialization", peak_reserved_gb=torch.cuda.max_memory_reserved()/2**30, elapsed_seconds=time.perf_counter()-begin, checkpoint_epoch=ck["epoch"])
+    metrics = dict(split=split, images=len(dataset), global_valid=int(valid.sum()), global_masked=int((~valid).sum()), global_coverage=float(valid.mean()), global_AP=aps, global_mAP=float(np.mean([v for v in aps.values() if v is not None])) if any(v is not None for v in aps.values()) else None, balanced_accuracy=float(balanced_accuracy_score(labels[valid], probabilities[valid].argmax(1))) if valid.any() else None, confusion_matrix=confusion_matrix(labels[valid], probabilities[valid].argmax(1), labels=[0, 1, 2]).tolist(), class_order=GLOBAL_NAMES, inference_ms_per_image=1000 * sum(t for t, n in latencies) / sum(n for t, n in latencies), inference_batch_size=ec["batch_size"], inference_timing="GPU model + both NMS paths, synchronized, excludes loading and CPU serialization", peak_reserved_gb=torch.cuda.max_memory_reserved()/2**30, elapsed_seconds=time.perf_counter()-begin, checkpoint_epoch=ck["epoch"])
     matrix = np.asarray(metrics['confusion_matrix'])
     metrics['class_recall'] = {name: float(matrix[i, i] / matrix[i].sum()) if matrix[i].sum() else None
                                for i, name in enumerate(GLOBAL_NAMES)}

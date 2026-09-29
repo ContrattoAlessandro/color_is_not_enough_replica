@@ -1,5 +1,6 @@
 """Training with persistent workers, clean per-epoch validation and resumable state."""
 import json
+from collections import Counter
 import random
 import time
 from pathlib import Path
@@ -61,7 +62,7 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
     if validation_enabled:
         from .split import assert_disjoint
         assert_disjoint({name: json.loads((prepared / f'{name}.json').read_text(encoding='utf-8')) for name in names})
-    dataset = DTLDDataset(prepared / 'train.json', tc['blur_probability'], limit, tc['seed'])
+    dataset = DTLDDataset(prepared / 'train.json', tc['blur_probability'], limit, tc['seed'], augmentation=tc.get('augmentation'), record_augmentation=tc.get('augmentation_statistics', False))
     max_epochs = epochs or tc['epochs']
     if max_epochs < 1:
         raise ValueError('epochs must be positive')
@@ -132,12 +133,15 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
             batches.sampler.set_epoch(epoch)
             optimizer.zero_grad(set_to_none=True)
             meter, seen, data_wait = LossMeter(), 0, 0.0
+            augmentation_counts = Counter()
             epoch_start = time.perf_counter()
             torch.cuda.reset_peak_memory_stats()
             iterator = iter(batches)
             for step in range(len(batches)):
                 waiting = time.perf_counter()
                 cpu_batch = next(iterator)
+                for operations in cpu_batch.get('augmentation_operations', []):
+                    augmentation_counts.update(operations or ['unmodified'])
                 data_wait += time.perf_counter() - waiting
                 batch = move_batch(cpu_batch, 'cuda')
                 n = len(batch['img'])
@@ -164,6 +168,8 @@ def train(config, resume=None, epochs=None, limit=None, output=None, batch_size=
             elapsed = time.perf_counter() - epoch_start
             row = dict(epoch=epoch + 1, training_phase=current_phase, train_seconds=elapsed, images_per_second=seen / elapsed, data_wait_seconds=data_wait, peak_reserved_gb=torch.cuda.max_memory_reserved() / 2**30, train_losses=meter.result())
             row['optimizer_updates'] = update_counter['steps'] - updates_before
+            if tc.get('augmentation') is not None or tc.get('augmentation_statistics', False):
+                row['augmentation_counts'] = dict(augmentation_counts)
             row['amp_skipped_updates'] = (len(batches) + accumulation - 1) // accumulation - row['optimizer_updates']
             if row['optimizer_updates'] == 0:
                 raise RuntimeError('All optimizer steps were skipped; refusing to advance the learning-rate schedule or save a trained epoch')
